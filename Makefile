@@ -27,4 +27,4 @@ test/build/test_example: test/example.cpp test/subdir1/foo.h test/subdir2/bar.h
 	./build/test_example
 
 clean:
-	rm -rf test/build libhugeargs.so
+	rm -rf test/build/* libhugeargs.so

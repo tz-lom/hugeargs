@@ -18,6 +18,19 @@
 #define DEBUG_PRN(x)
 #endif
 
+#define DEBUG_REDIRECT(name, path) DEBUG_PRN({ \
+        std::cerr << "Redirecting "#name" call for: " << path << std::endl; \
+        for (int i = 0; argv[i] != NULL; ++i) \
+        { \
+            std::cerr << "argv[" << i << "]: " << argv[i] << std::endl; \
+        } \
+        std::cerr << "to" << std::endl; \
+        for (int i = 0; new_argv[i] != NULL; ++i) \
+        { \
+            std::cerr << "new_argv[" << i << "]: " << new_argv[i] << std::endl; \
+        } \
+    })
+
 extern "C" {
 int __libc_start_main(int (*main) (int, char * *, char * *), int argc, char * * ubp_av, void (*init) (void), void (*fini) (void), void (*rtld_fini) (void), void (* stack_end));
 
@@ -53,7 +66,7 @@ static void init_self_name()
     }
     else
     {
-        snprintf(g_self_name, sizeof(g_self_name), "libarghack.so");
+        snprintf(g_self_name, sizeof(g_self_name), "libhugeargs.so");
     }
 }
 
@@ -164,7 +177,7 @@ static bool should_ignore_process(const char *path)
         name = name.substr(slash + 1);
     }
 
-    std::cerr << "Checking if process should be ignored: " << name << std::endl;
+    DEBUG_PRN(std::cerr << "Checking if process should be ignored: " << name << std::endl;)
 
     std::size_t start = 0;
     while (start < ignore_list.size())
@@ -173,7 +186,7 @@ static bool should_ignore_process(const char *path)
         const std::string item = ignore_list.substr(start, end == std::string::npos ? std::string::npos : end - start);
         if (!item.empty() && item == name)
         {
-            std::cerr << "Process " << name << " is in the ignore list." << std::endl;
+            DEBUG_PRN(std::cerr << "Process " << name << " is in the ignore list." << std::endl;)
             return true;
         }
         if (end == std::string::npos)
@@ -218,9 +231,9 @@ int execve(const char *pathname, char *const argv[], char *const envp[])
         char tmp_path[PATH_MAX];
         if (write_hugeargs_file(argv, tmp_path, sizeof(tmp_path)))
         {
-            DEBUG_PRN(std::cerr << "Redirecting execve for pathname: " << pathname << std::endl;)
             char *file_arg = strdup(tmp_path);
             char *new_argv[] = { argv[0], file_arg, NULL };
+            DEBUG_REDIRECT(execve, pathname);
             const int rc = real_execve(pathname, new_argv, envp);
             free(file_arg);
             return rc;
@@ -237,17 +250,9 @@ int execv(const char *path, char *const argv[] )
         char tmp_path[PATH_MAX];
         if (write_hugeargs_file(argv, tmp_path, sizeof(tmp_path)))
         {
-            DEBUG_PRN(std::cerr << "Redirecting execv for path: " << path << std::endl;)
             char *file_arg = strdup(tmp_path);
             char *new_argv[] = { argv[0], file_arg, NULL };
-            DEBUG_PRN({
-                std::cerr << "New arguments for execv: ";
-                for (int i = 0; new_argv[i] != NULL; ++i)
-                {
-                    std::cerr << new_argv[i] << " ";
-                }
-                std::cerr << std::endl;
-            })
+            DEBUG_REDIRECT(execv, path);
             const int rc = real_execv(path, new_argv);
             free(file_arg);
             return rc;
@@ -264,23 +269,9 @@ int execvp(const char *file, char *const argv[])
         char tmp_path[PATH_MAX];
         if (write_hugeargs_file(argv, tmp_path, sizeof(tmp_path)))
         {
-            DEBUG_PRN({
-                std::cerr << "Redirecting execvp for file: " << file << " with arguments: ";
-                for (int i = 0; argv[i] != NULL; ++i)
-                {
-                    std::cerr << argv[i] << " ";
-                }
-                std::cerr << std::endl;
-            })
             char *file_arg = strdup(tmp_path);
             char *new_argv[] = { argv[0], file_arg, NULL };
-            DEBUG_PRN({std::cerr << "New arguments for execve: ";
-                for (int i = 0; new_argv[i] != NULL; ++i)
-                {
-                    std::cerr << new_argv[i] << " ";
-                }
-                std::cerr << std::endl;
-            })
+            DEBUG_REDIRECT(execvp, file);
             const int rc = real_execvp(file, new_argv);
             free(file_arg);
             return rc;
@@ -297,10 +288,9 @@ int execvpe(const char *file, char *const argv[], char *const envp[])
         char tmp_path[PATH_MAX];
         if (write_hugeargs_file(argv, tmp_path, sizeof(tmp_path)))
         {
-            DEBUG_PRN(std::cerr << "Redirecting execvpe for file: " << file << std::endl;)
-
             char *file_arg = strdup(tmp_path);
             char *new_argv[] = { argv[0], file_arg, NULL };
+            DEBUG_REDIRECT(execvpe, file);
             const int rc = real_execve(file, new_argv, envp);
             free(file_arg);
             return rc;
@@ -317,9 +307,9 @@ int posix_spawn(pid_t *pid, const char *path, const posix_spawn_file_actions_t *
         char tmp_path[PATH_MAX];
         if (write_hugeargs_file(argv, tmp_path, sizeof(tmp_path)))
         {
-            DEBUG_PRN(std::cerr << "Redirecting posix_spawn for path: " << path << std::endl;)
             char *file_arg = strdup(tmp_path);
             char *new_argv[] = { argv[0], file_arg, NULL };
+            DEBUG_REDIRECT(posix_spawn, path);
             const int rc = real_posix_spawn(pid, path, file_actions, attrp, new_argv, envp);
             free(file_arg);
             return rc;
@@ -336,9 +326,9 @@ int posix_spawnp(pid_t *pid, const char *file, const posix_spawn_file_actions_t 
         char tmp_path[PATH_MAX];
         if (write_hugeargs_file(argv, tmp_path, sizeof(tmp_path)))
         {
-            DEBUG_PRN(std::cerr << "Redirecting posix_spawnp for file: " << file << std::endl;)
             char *file_arg = strdup(tmp_path);
             char *new_argv[] = { argv[0], file_arg, NULL };
+            DEBUG_REDIRECT(posix_spawnp, file);
             const int rc = real_posix_spawnp(pid, file, file_actions, attrp, new_argv, envp);
             free(file_arg);
             return rc;

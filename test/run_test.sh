@@ -7,7 +7,7 @@ cd "$CURRENT_DIR/.."
 
 ARGS=$(python3 <<'PY'
 import sys
-print('-Itest/subdir1 ' * 1024 * 1024, end='')
+print('-Itest/subdir1 ' * 1024 * 150, end='')
 print('-Itest/subdir2')
 PY
 )
