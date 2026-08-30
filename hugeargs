@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+export LD_PRELOAD="$SCRIPT_DIR/libhugeargs.so":"${LD_PRELOAD:-}"
+export HUGEARGS_TMPDIR=$(mktemp --tmpdir -d "hugeargs.XXXXXX")
+trap 'rm -rf "$HUGEARGS_TMPDIR"' EXIT
+executable="$1"
+argname=$(mktemp -p "$HUGEARGS_TMPDIR" "hugeargs-XXXXXX")
+
+printf '%s\0' ${@:2} > "$argname"
+
+"$executable" "$argname"
