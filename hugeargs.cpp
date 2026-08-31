@@ -29,6 +29,18 @@
         { \
             std::cerr << "new_argv[" << i << "]: " << new_argv[i] << std::endl; \
         } \
+        for(int i = 0; environ[i] != NULL; ++i) \
+        { \
+            std::cerr << "environ[" << i << "]: " << environ[i] << std::endl; \
+        } \
+    })
+
+#define DEBUG_NO_REDIRECT(name) DEBUG_PRN({ \
+        std::cerr << "Not redirecting " #name " call" << std::endl; \
+        for (int i = 0; argv[i] != NULL; ++i) \
+        { \
+            std::cerr << "argv[" << i << "]: " << argv[i] << std::endl; \
+        } \
     })
 
 extern "C" {
@@ -36,12 +48,17 @@ int __libc_start_main(int (*main) (int, char * *, char * *), int argc, char * * 
 
 static decltype(&__libc_start_main) real_libc_start_main = NULL;
 using execve_fn = int (*)(const char *, char *const[], char *const[]);
+using execveat_fn = int (*)(int, const char *, char *const[], char *const[], int);
+using fexecve_fn = int (*)(int, char *const[], char *const[]);
 using execv_fn = int (*)(const char *, char *const[]);
 using execvp_fn = int (*)(const char *, char *const[]);
 using execvpe_fn = int (*)(const char *, char *const[], char *const[]);
 using posix_spawn_fn = int (*)(pid_t *, const char *, const posix_spawn_file_actions_t *, const posix_spawnattr_t *, char *const[], char *const[]);
 using posix_spawnp_fn = int (*)(pid_t *, const char *, const posix_spawn_file_actions_t *, const posix_spawnattr_t *, char *const[], char *const[]);
 static execve_fn real_execve = NULL;
+static execveat_fn real_execveat = NULL;
+static fexecve_fn real_fexecve = NULL;
+static execve_fn real___execve = NULL;
 static execv_fn real_execv = NULL;
 static execvp_fn real_execvp = NULL;
 static execvpe_fn real_execvpe = NULL;
@@ -82,9 +99,19 @@ static bool ld_preload_contains_self()
     return strstr(preload, g_self_name) != NULL;
 }
 
+static const std::string ARG_FILE_PREFIX = "--HUGEARGS_PLEASE_LOAD_ARGUMENTS_FROM_FILE=";
+
 static std::vector<std::string> load_argument_file(const std::string &path)
 {
-    std::ifstream input(path, std::ios::binary);
+    DEBUG_PRN(std::cerr << "Loading arguments from file: " << path << std::endl;)
+    DEBUG_PRN(std::cerr << "Argument file prefix: " << path.substr(0, ARG_FILE_PREFIX.size()) << std::endl;)
+    if(path.substr(0, ARG_FILE_PREFIX.size()) != ARG_FILE_PREFIX)
+    {
+        return {};
+    }
+    DEBUG_PRN(std::cerr << "Argument file prefix matched: " << ARG_FILE_PREFIX << std::endl;)
+    const std::string file_path = path.substr(ARG_FILE_PREFIX.size());
+    std::ifstream input(file_path, std::ios::binary);
     if (!input)
     {
         return {};
@@ -199,8 +226,32 @@ static bool should_ignore_process(const char *path)
     return false;
 }
 
+static bool large_arg_count(char *const argv[])
+{
+    if (argv == NULL)
+    {
+        return false;
+    }
+
+    int count = 0;
+    for (int i = 0; argv[i] != NULL; ++i)
+    {
+        ++count;
+        if (count > 255)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static bool should_redirect_exec(char *const argv[])
 {
+    if(!large_arg_count(argv))
+    {
+        return false;
+    }
     if (!ld_preload_contains_self())
     {
         return false;
@@ -231,16 +282,85 @@ int execve(const char *pathname, char *const argv[], char *const envp[])
         char tmp_path[PATH_MAX];
         if (write_hugeargs_file(argv, tmp_path, sizeof(tmp_path)))
         {
-            char *file_arg = strdup(tmp_path);
-            char *new_argv[] = { argv[0], file_arg, NULL };
+            std::string file_arg = ARG_FILE_PREFIX+tmp_path;
+            char *new_argv[] = { argv[0], const_cast<char *>(file_arg.c_str()), NULL };
             DEBUG_REDIRECT(execve, pathname);
             const int rc = real_execve(pathname, new_argv, envp);
-            free(file_arg);
             return rc;
         }
     }
+    else
+    {
+        DEBUG_NO_REDIRECT(execve);
+    }
 
     return real_execve(pathname, argv, envp);
+}
+
+int __execve(const char *pathname, char *const argv[], char *const envp[])
+{
+    if (should_redirect_exec(argv))
+    {
+        char tmp_path[PATH_MAX];
+        if (write_hugeargs_file(argv, tmp_path, sizeof(tmp_path)))
+        {
+            std::string file_arg = ARG_FILE_PREFIX+tmp_path;
+            char *new_argv[] = { argv[0], const_cast<char *>(file_arg.c_str()), NULL };
+            DEBUG_REDIRECT(__execve, pathname);
+            const int rc = real___execve(pathname, new_argv, envp);
+            return rc;
+        }
+    }
+    else
+    {
+        DEBUG_NO_REDIRECT(__execve);
+    }
+
+    return real___execve(pathname, argv, envp);
+}
+
+int execveat(int dirfd, const char *pathname, char *const argv[], char *const envp[], int flags)
+{
+    if (should_redirect_exec(argv))
+    {
+        char tmp_path[PATH_MAX];
+        if (write_hugeargs_file(argv, tmp_path, sizeof(tmp_path)))
+        {
+            std::string file_arg = ARG_FILE_PREFIX+tmp_path;
+            char *new_argv[] = { argv[0], const_cast<char *>(file_arg.c_str()), NULL };
+            DEBUG_REDIRECT(execveat, pathname);
+            const int rc = real_execveat(dirfd, pathname, new_argv, envp, flags);
+            return rc;
+        }
+    }
+    else
+    {
+        DEBUG_NO_REDIRECT(execveat);
+    }
+
+    return real_execveat(dirfd, pathname, argv, envp, flags);
+}
+
+int fexecve(int fd, char *const argv[], char *const envp[])
+{
+    if (should_redirect_exec(argv))
+    {
+        char tmp_path[PATH_MAX];
+        if (write_hugeargs_file(argv, tmp_path, sizeof(tmp_path)))
+        {
+            std::string file_arg = ARG_FILE_PREFIX+tmp_path;
+            char *new_argv[] = { argv[0], const_cast<char *>(file_arg.c_str()), NULL };
+            DEBUG_REDIRECT(fexecve, "<fd>");
+            const int rc = real_fexecve(fd, new_argv, envp);
+            return rc;
+        }
+    }
+    else
+    {
+        DEBUG_NO_REDIRECT(fexecve);
+    }
+
+    return real_fexecve(fd, argv, envp);
 }
 
 int execv(const char *path, char *const argv[] )
@@ -250,13 +370,17 @@ int execv(const char *path, char *const argv[] )
         char tmp_path[PATH_MAX];
         if (write_hugeargs_file(argv, tmp_path, sizeof(tmp_path)))
         {
-            char *file_arg = strdup(tmp_path);
-            char *new_argv[] = { argv[0], file_arg, NULL };
+            std::string file_arg = ARG_FILE_PREFIX+tmp_path;
+            char *new_argv[] = { argv[0], const_cast<char *>(file_arg.c_str()), NULL };
             DEBUG_REDIRECT(execv, path);
             const int rc = real_execv(path, new_argv);
-            free(file_arg);
+            DEBUG_PRN(std::cerr << "execv result: " << rc << std::endl;)
             return rc;
         }
+    }
+    else
+    {
+        DEBUG_NO_REDIRECT(execv);
     }
 
     return real_execv(path, argv);
@@ -269,13 +393,16 @@ int execvp(const char *file, char *const argv[])
         char tmp_path[PATH_MAX];
         if (write_hugeargs_file(argv, tmp_path, sizeof(tmp_path)))
         {
-            char *file_arg = strdup(tmp_path);
-            char *new_argv[] = { argv[0], file_arg, NULL };
+            std::string file_arg = ARG_FILE_PREFIX+tmp_path;
+            char *new_argv[] = { argv[0], const_cast<char *>(file_arg.c_str()), NULL };
             DEBUG_REDIRECT(execvp, file);
             const int rc = real_execvp(file, new_argv);
-            free(file_arg);
             return rc;
         }
+    }
+    else
+    {
+        DEBUG_NO_REDIRECT(execvp);
     }
 
     return real_execvp(file, argv);
@@ -288,13 +415,16 @@ int execvpe(const char *file, char *const argv[], char *const envp[])
         char tmp_path[PATH_MAX];
         if (write_hugeargs_file(argv, tmp_path, sizeof(tmp_path)))
         {
-            char *file_arg = strdup(tmp_path);
-            char *new_argv[] = { argv[0], file_arg, NULL };
+            std::string file_arg = ARG_FILE_PREFIX+tmp_path;
+            char *new_argv[] = { argv[0], const_cast<char *>(file_arg.c_str()), NULL };
             DEBUG_REDIRECT(execvpe, file);
-            const int rc = real_execve(file, new_argv, envp);
-            free(file_arg);
+            const int rc = real_execvpe(file, new_argv, envp);
             return rc;
         }
+    }
+    else
+    {
+        DEBUG_NO_REDIRECT(execvpe);
     }
 
     return real_execvpe(file, argv, envp);
@@ -307,13 +437,16 @@ int posix_spawn(pid_t *pid, const char *path, const posix_spawn_file_actions_t *
         char tmp_path[PATH_MAX];
         if (write_hugeargs_file(argv, tmp_path, sizeof(tmp_path)))
         {
-            char *file_arg = strdup(tmp_path);
-            char *new_argv[] = { argv[0], file_arg, NULL };
+            std::string file_arg = ARG_FILE_PREFIX+tmp_path;
+            char *new_argv[] = { argv[0], const_cast<char *>(file_arg.c_str()), NULL };
             DEBUG_REDIRECT(posix_spawn, path);
             const int rc = real_posix_spawn(pid, path, file_actions, attrp, new_argv, envp);
-            free(file_arg);
             return rc;
         }
+    }
+    else
+    {
+        DEBUG_NO_REDIRECT(posix_spawn);
     }
 
     return real_posix_spawn(pid, path, file_actions, attrp, argv, envp);
@@ -326,13 +459,16 @@ int posix_spawnp(pid_t *pid, const char *file, const posix_spawn_file_actions_t 
         char tmp_path[PATH_MAX];
         if (write_hugeargs_file(argv, tmp_path, sizeof(tmp_path)))
         {
-            char *file_arg = strdup(tmp_path);
-            char *new_argv[] = { argv[0], file_arg, NULL };
+            std::string file_arg = ARG_FILE_PREFIX+tmp_path;
+            char *new_argv[] = { argv[0], const_cast<char *>(file_arg.c_str()), NULL };
             DEBUG_REDIRECT(posix_spawnp, file);
             const int rc = real_posix_spawnp(pid, file, file_actions, attrp, new_argv, envp);
-            free(file_arg);
             return rc;
         }
+    }
+    else
+    {
+        DEBUG_NO_REDIRECT(posix_spawnp);
     }
 
     return real_posix_spawnp(pid, file, file_actions, attrp, argv, envp);
@@ -342,6 +478,7 @@ int __libc_start_main(int (*main) (int, char * *, char * *), int argc, char * * 
 {
     if (argc == 2)
     {
+        DEBUG_PRN(std::cerr << "Checking for argument file: " << ubp_av[1] << std::endl;)
         const std::vector<std::string> loaded_args = load_argument_file(ubp_av[1]);
         if (!loaded_args.empty())
         {
@@ -396,6 +533,9 @@ __attribute__((constructor)) static void on_load()
 {
     real_libc_start_main = (decltype(&__libc_start_main))dlsym(RTLD_NEXT, "__libc_start_main");
     real_execve = (execve_fn)dlsym(RTLD_NEXT, "execve");
+    real_execveat = (execveat_fn)dlsym(RTLD_NEXT, "execveat");
+    real_fexecve = (fexecve_fn)dlsym(RTLD_NEXT, "fexecve");
+    real___execve = (execve_fn)dlsym(RTLD_NEXT, "__execve");
     real_execv = (execv_fn)dlsym(RTLD_NEXT, "execv");
     real_execvp = (execvp_fn)dlsym(RTLD_NEXT, "execvp");
     real_execvpe = (execvpe_fn)dlsym(RTLD_NEXT, "execvpe");

@@ -19,7 +19,7 @@ test/build/myenv: test/myenv.cpp
 	$(CXX) $(CXXFLAGS) -o $@ $<
 
 libhugeargs.so: hugeargs.cpp
-	$(CXX) $(CXXFLAGS) -shared -fPIC -o $@ $<
+	$(CXX) $(CXXFLAGS) -shared -ldl -fPIC -o $@ $<
 
 test/build/test_example: test/example.cpp test/subdir1/foo.h test/subdir2/bar.h
 	cd test
