@@ -9,6 +9,8 @@
 #include <spawn.h>
 #include <string>
 #include <string.h>
+#include <unordered_set>
+#include <unordered_map>
 #include <unistd.h>
 #include <vector>
 
@@ -45,6 +47,7 @@
 
 extern "C" {
 int __libc_start_main(int (*main) (int, char * *, char * *), int argc, char * * ubp_av, void (*init) (void), void (*fini) (void), void (*rtld_fini) (void), void (* stack_end));
+extern char **environ;
 
 static decltype(&__libc_start_main) real_libc_start_main = NULL;
 using execve_fn = int (*)(const char *, char *const[], char *const[]);
@@ -100,25 +103,77 @@ static bool ld_preload_contains_self()
 }
 
 static const std::string ARG_FILE_PREFIX = "--HUGEARGS_PLEASE_LOAD_ARGUMENTS_FROM_FILE=";
+static const std::string ARG_FILE_MAGIC = "HUGEARGS_V1";
+static constexpr size_t REDIRECT_THRESHOLD_BYTES = 1900000;
 
-static std::vector<std::string> load_argument_file(const std::string &path)
+struct packed_exec_data
 {
+    bool has_prefix = false;
+    std::vector<std::string> args;
+    std::vector<std::string> env;
+};
+
+static bool read_nul_section(const std::string &data, std::size_t &pos, std::vector<std::string> &out)
+{
+    while (pos < data.size())
+    {
+        const std::size_t end = data.find('\0', pos);
+        if (end == std::string::npos)
+        {
+            return false;
+        }
+
+        if (end == pos)
+        {
+            pos = end + 1;
+            return true;
+        }
+
+        out.emplace_back(data.substr(pos, end - pos));
+        pos = end + 1;
+    }
+
+    return false;
+}
+
+static packed_exec_data load_argument_file(const std::string &path)
+{
+    packed_exec_data loaded;
     DEBUG_PRN(std::cerr << "Loading arguments from file: " << path << std::endl;)
     DEBUG_PRN(std::cerr << "Argument file prefix: " << path.substr(0, ARG_FILE_PREFIX.size()) << std::endl;)
     if(path.substr(0, ARG_FILE_PREFIX.size()) != ARG_FILE_PREFIX)
     {
-        return {};
+        return loaded;
     }
+    loaded.has_prefix = true;
     DEBUG_PRN(std::cerr << "Argument file prefix matched: " << ARG_FILE_PREFIX << std::endl;)
     const std::string file_path = path.substr(ARG_FILE_PREFIX.size());
     std::ifstream input(file_path, std::ios::binary);
     if (!input)
     {
-        return {};
+        return loaded;
     }
 
     std::string file_data((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    std::vector<std::string> args;
+
+    const std::string magic_with_nul = ARG_FILE_MAGIC + "\0";
+    if (file_data.size() >= magic_with_nul.size() && file_data.compare(0, magic_with_nul.size(), magic_with_nul) == 0)
+    {
+        std::size_t pos = magic_with_nul.size();
+        if (!read_nul_section(file_data, pos, loaded.args))
+        {
+            loaded.args.clear();
+            loaded.env.clear();
+            return loaded;
+        }
+        if (!read_nul_section(file_data, pos, loaded.env))
+        {
+            loaded.args.clear();
+            loaded.env.clear();
+            return loaded;
+        }
+        return loaded;
+    }
 
     std::size_t start = 0;
     while (start < file_data.size())
@@ -128,22 +183,22 @@ static std::vector<std::string> load_argument_file(const std::string &path)
         {
             if (start < file_data.size())
             {
-                args.emplace_back(file_data.substr(start));
+                loaded.args.emplace_back(file_data.substr(start));
             }
             break;
         }
 
         if (end > start)
         {
-            args.emplace_back(file_data.substr(start, end - start));
+            loaded.args.emplace_back(file_data.substr(start, end - start));
         }
         start = end + 1;
     }
 
-    return args;
+    return loaded;
 }
 
-static bool write_hugeargs_file(char *const argv[], char *out_path, size_t out_size)
+static bool write_hugeargs_file(char *const argv[], char *const envp[], char *out_path, size_t out_size)
 {
     const char *tmpdir = getenv("HUGEARGS_TMPDIR");
     if (tmpdir == NULL || tmpdir[0] == '\0')
@@ -157,6 +212,14 @@ static bool write_hugeargs_file(char *const argv[], char *out_path, size_t out_s
     const int fd = mkstemp(template_path);
     if (fd < 0)
     {
+        return false;
+    }
+
+    const std::string magic_with_nul = ARG_FILE_MAGIC + "\0";
+    if (write(fd, magic_with_nul.data(), magic_with_nul.size()) < 0)
+    {
+        close(fd);
+        unlink(template_path);
         return false;
     }
 
@@ -181,6 +244,38 @@ static bool write_hugeargs_file(char *const argv[], char *out_path, size_t out_s
             unlink(template_path);
             return false;
         }
+    }
+
+    if (write(fd, "\0", 1) < 0)
+    {
+        close(fd);
+        unlink(template_path);
+        return false;
+    }
+
+    for (int i = 0; envp != NULL && envp[i] != NULL; ++i)
+    {
+        const char *env = envp[i];
+        const size_t len = strlen(env);
+        if (len > 0 && write(fd, env, len) < 0)
+        {
+            close(fd);
+            unlink(template_path);
+            return false;
+        }
+        if (write(fd, "\0", 1) < 0)
+        {
+            close(fd);
+            unlink(template_path);
+            return false;
+        }
+    }
+
+    if (write(fd, "\0", 1) < 0)
+    {
+        close(fd);
+        unlink(template_path);
+        return false;
     }
 
     close(fd);
@@ -226,38 +321,41 @@ static bool should_ignore_process(const char *path)
     return false;
 }
 
-static bool large_arg_count(char *const argv[])
+static size_t count_exec_memory_bytes(char *const argv[], char *const envp[])
 {
-    if (argv == NULL)
+    size_t bytes = 0;
+    size_t argc = 0;
+    size_t envc = 0;
+
+    for (int i = 0; argv != NULL && argv[i] != NULL; ++i)
     {
-        return false;
+        bytes += strlen(argv[i]) + 1;
+        ++argc;
     }
 
-    int count = 0;
-    for (int i = 0; argv[i] != NULL; ++i)
+    for (int i = 0; envp != NULL && envp[i] != NULL; ++i)
     {
-        ++count;
-        if (count > 255)
-        {
-            return true;
-        }
+        bytes += strlen(envp[i]) + 1;
+        ++envc;
     }
 
-    return false;
+    bytes += (argc + 1 + envc + 1) * sizeof(char *);
+    return bytes;
 }
 
-static bool should_redirect_exec(char *const argv[])
+static bool should_redirect_exec(char *const argv[], char *const envp[])
 {
-    if(!large_arg_count(argv))
-    {
-        return false;
-    }
-    if (!ld_preload_contains_self())
+    if (argv == NULL || argv[0] == NULL)
     {
         return false;
     }
 
-    if (argv == NULL || argv[0] == NULL)
+    if (count_exec_memory_bytes(argv, envp) <= REDIRECT_THRESHOLD_BYTES)
+    {
+        return false;
+    }
+
+    if (!ld_preload_contains_self())
     {
         return false;
     }
@@ -275,17 +373,147 @@ static bool should_redirect_exec(char *const argv[])
     return true;
 }
 
+static size_t count_exec_memory_bytes_with_env_vector(char *const argv[], const std::vector<std::string> &env)
+{
+    size_t bytes = 0;
+    size_t argc = 0;
+
+    for (int i = 0; argv != NULL && argv[i] != NULL; ++i)
+    {
+        bytes += strlen(argv[i]) + 1;
+        ++argc;
+    }
+
+    for (const auto &entry : env)
+    {
+        bytes += entry.size() + 1;
+    }
+
+    bytes += (argc + 1 + env.size() + 1) * sizeof(char *);
+    return bytes;
+}
+
+static std::string env_key(const std::string &entry)
+{
+    const std::size_t eq = entry.find('=');
+    return eq == std::string::npos ? entry : entry.substr(0, eq);
+}
+
+static std::vector<std::string> build_runtime_env(char *const source_envp[], char *const redirected_argv[])
+{
+    std::vector<std::string> env;
+    for (int i = 0; source_envp != NULL && source_envp[i] != NULL; ++i)
+    {
+        env.emplace_back(source_envp[i]);
+    }
+
+    if (count_exec_memory_bytes_with_env_vector(redirected_argv, env) <= REDIRECT_THRESHOLD_BYTES)
+    {
+        return env;
+    }
+
+    struct env_item
+    {
+        std::string entry;
+        std::string key;
+        bool keep;
+        bool dropped;
+    };
+
+    const std::unordered_set<std::string> keep_keys = {
+        "LD_PRELOAD",
+        "PATH",
+        "LD_LIBRARY_PATH",
+        "HUGEARGS_TMPDIR",
+        "HUGEARGS_IGNORE"
+    };
+
+    std::vector<env_item> items;
+    items.reserve(env.size());
+    for (const auto &entry : env)
+    {
+        const std::string key = env_key(entry);
+        items.push_back(env_item{entry, key, keep_keys.find(key) != keep_keys.end(), false});
+    }
+
+    auto bytes_with_items = [&]() {
+        std::vector<std::string> current;
+        current.reserve(items.size());
+        for (const auto &item : items)
+        {
+            if (!item.dropped)
+            {
+                current.push_back(item.entry);
+            }
+        }
+        return count_exec_memory_bytes_with_env_vector(redirected_argv, current);
+    };
+
+    while (bytes_with_items() > REDIRECT_THRESHOLD_BYTES)
+    {
+        int drop_idx = -1;
+        size_t drop_len = 0;
+
+        for (std::size_t i = 0; i < items.size(); ++i)
+        {
+            if (items[i].dropped || items[i].keep)
+            {
+                continue;
+            }
+            if (drop_idx < 0 || items[i].entry.size() > drop_len)
+            {
+                drop_idx = static_cast<int>(i);
+                drop_len = items[i].entry.size();
+            }
+        }
+
+        if (drop_idx < 0)
+        {
+            break;
+        }
+
+        items[drop_idx].dropped = true;
+    }
+
+    std::vector<std::string> filtered;
+    filtered.reserve(items.size());
+    for (const auto &item : items)
+    {
+        if (!item.dropped)
+        {
+            filtered.push_back(item.entry);
+        }
+    }
+
+    return filtered;
+}
+
+static std::vector<char *> env_ptrs_from_strings(std::vector<std::string> &env)
+{
+    std::vector<char *> ptrs;
+    ptrs.reserve(env.size() + 1);
+    for (auto &entry : env)
+    {
+        ptrs.push_back(const_cast<char *>(entry.c_str()));
+    }
+    ptrs.push_back(nullptr);
+    return ptrs;
+}
+
 int execve(const char *pathname, char *const argv[], char *const envp[])
 {
-    if (should_redirect_exec(argv))
+    char *const *effective_envp = envp != NULL ? envp : environ;
+    if (should_redirect_exec(argv, const_cast<char *const *>(effective_envp)))
     {
         char tmp_path[PATH_MAX];
-        if (write_hugeargs_file(argv, tmp_path, sizeof(tmp_path)))
+        if (write_hugeargs_file(argv, const_cast<char *const *>(effective_envp), tmp_path, sizeof(tmp_path)))
         {
             std::string file_arg = ARG_FILE_PREFIX+tmp_path;
             char *new_argv[] = { argv[0], const_cast<char *>(file_arg.c_str()), NULL };
+            std::vector<std::string> runtime_env = build_runtime_env(const_cast<char *const *>(effective_envp), new_argv);
+            std::vector<char *> runtime_envp = env_ptrs_from_strings(runtime_env);
             DEBUG_REDIRECT(execve, pathname);
-            const int rc = real_execve(pathname, new_argv, envp);
+            const int rc = real_execve(pathname, new_argv, runtime_envp.data());
             return rc;
         }
     }
@@ -299,15 +527,18 @@ int execve(const char *pathname, char *const argv[], char *const envp[])
 
 int __execve(const char *pathname, char *const argv[], char *const envp[])
 {
-    if (should_redirect_exec(argv))
+    char *const *effective_envp = envp != NULL ? envp : environ;
+    if (should_redirect_exec(argv, const_cast<char *const *>(effective_envp)))
     {
         char tmp_path[PATH_MAX];
-        if (write_hugeargs_file(argv, tmp_path, sizeof(tmp_path)))
+        if (write_hugeargs_file(argv, const_cast<char *const *>(effective_envp), tmp_path, sizeof(tmp_path)))
         {
             std::string file_arg = ARG_FILE_PREFIX+tmp_path;
             char *new_argv[] = { argv[0], const_cast<char *>(file_arg.c_str()), NULL };
+            std::vector<std::string> runtime_env = build_runtime_env(const_cast<char *const *>(effective_envp), new_argv);
+            std::vector<char *> runtime_envp = env_ptrs_from_strings(runtime_env);
             DEBUG_REDIRECT(__execve, pathname);
-            const int rc = real___execve(pathname, new_argv, envp);
+            const int rc = real___execve(pathname, new_argv, runtime_envp.data());
             return rc;
         }
     }
@@ -321,15 +552,18 @@ int __execve(const char *pathname, char *const argv[], char *const envp[])
 
 int execveat(int dirfd, const char *pathname, char *const argv[], char *const envp[], int flags)
 {
-    if (should_redirect_exec(argv))
+    char *const *effective_envp = envp != NULL ? envp : environ;
+    if (should_redirect_exec(argv, const_cast<char *const *>(effective_envp)))
     {
         char tmp_path[PATH_MAX];
-        if (write_hugeargs_file(argv, tmp_path, sizeof(tmp_path)))
+        if (write_hugeargs_file(argv, const_cast<char *const *>(effective_envp), tmp_path, sizeof(tmp_path)))
         {
             std::string file_arg = ARG_FILE_PREFIX+tmp_path;
             char *new_argv[] = { argv[0], const_cast<char *>(file_arg.c_str()), NULL };
+            std::vector<std::string> runtime_env = build_runtime_env(const_cast<char *const *>(effective_envp), new_argv);
+            std::vector<char *> runtime_envp = env_ptrs_from_strings(runtime_env);
             DEBUG_REDIRECT(execveat, pathname);
-            const int rc = real_execveat(dirfd, pathname, new_argv, envp, flags);
+            const int rc = real_execveat(dirfd, pathname, new_argv, runtime_envp.data(), flags);
             return rc;
         }
     }
@@ -343,15 +577,18 @@ int execveat(int dirfd, const char *pathname, char *const argv[], char *const en
 
 int fexecve(int fd, char *const argv[], char *const envp[])
 {
-    if (should_redirect_exec(argv))
+    char *const *effective_envp = envp != NULL ? envp : environ;
+    if (should_redirect_exec(argv, const_cast<char *const *>(effective_envp)))
     {
         char tmp_path[PATH_MAX];
-        if (write_hugeargs_file(argv, tmp_path, sizeof(tmp_path)))
+        if (write_hugeargs_file(argv, const_cast<char *const *>(effective_envp), tmp_path, sizeof(tmp_path)))
         {
             std::string file_arg = ARG_FILE_PREFIX+tmp_path;
             char *new_argv[] = { argv[0], const_cast<char *>(file_arg.c_str()), NULL };
+            std::vector<std::string> runtime_env = build_runtime_env(const_cast<char *const *>(effective_envp), new_argv);
+            std::vector<char *> runtime_envp = env_ptrs_from_strings(runtime_env);
             DEBUG_REDIRECT(fexecve, "<fd>");
-            const int rc = real_fexecve(fd, new_argv, envp);
+            const int rc = real_fexecve(fd, new_argv, runtime_envp.data());
             return rc;
         }
     }
@@ -365,15 +602,20 @@ int fexecve(int fd, char *const argv[], char *const envp[])
 
 int execv(const char *path, char *const argv[] )
 {
-    if (should_redirect_exec(argv))
+    if (should_redirect_exec(argv, environ))
     {
         char tmp_path[PATH_MAX];
-        if (write_hugeargs_file(argv, tmp_path, sizeof(tmp_path)))
+        if (write_hugeargs_file(argv, environ, tmp_path, sizeof(tmp_path)))
         {
             std::string file_arg = ARG_FILE_PREFIX+tmp_path;
             char *new_argv[] = { argv[0], const_cast<char *>(file_arg.c_str()), NULL };
+            std::vector<std::string> runtime_env = build_runtime_env(environ, new_argv);
+            std::vector<char *> runtime_envp = env_ptrs_from_strings(runtime_env);
+            char **saved_environ = environ;
+            environ = runtime_envp.data();
             DEBUG_REDIRECT(execv, path);
             const int rc = real_execv(path, new_argv);
+            environ = saved_environ;
             DEBUG_PRN(std::cerr << "execv result: " << rc << std::endl;)
             return rc;
         }
@@ -388,15 +630,20 @@ int execv(const char *path, char *const argv[] )
 
 int execvp(const char *file, char *const argv[])
 {
-    if (should_redirect_exec(argv))
+    if (should_redirect_exec(argv, environ))
     {
         char tmp_path[PATH_MAX];
-        if (write_hugeargs_file(argv, tmp_path, sizeof(tmp_path)))
+        if (write_hugeargs_file(argv, environ, tmp_path, sizeof(tmp_path)))
         {
             std::string file_arg = ARG_FILE_PREFIX+tmp_path;
             char *new_argv[] = { argv[0], const_cast<char *>(file_arg.c_str()), NULL };
+            std::vector<std::string> runtime_env = build_runtime_env(environ, new_argv);
+            std::vector<char *> runtime_envp = env_ptrs_from_strings(runtime_env);
+            char **saved_environ = environ;
+            environ = runtime_envp.data();
             DEBUG_REDIRECT(execvp, file);
             const int rc = real_execvp(file, new_argv);
+            environ = saved_environ;
             return rc;
         }
     }
@@ -410,15 +657,18 @@ int execvp(const char *file, char *const argv[])
 
 int execvpe(const char *file, char *const argv[], char *const envp[])
 {
-    if (should_redirect_exec(argv))
+    char *const *effective_envp = envp != NULL ? envp : environ;
+    if (should_redirect_exec(argv, const_cast<char *const *>(effective_envp)))
     {
         char tmp_path[PATH_MAX];
-        if (write_hugeargs_file(argv, tmp_path, sizeof(tmp_path)))
+        if (write_hugeargs_file(argv, const_cast<char *const *>(effective_envp), tmp_path, sizeof(tmp_path)))
         {
             std::string file_arg = ARG_FILE_PREFIX+tmp_path;
             char *new_argv[] = { argv[0], const_cast<char *>(file_arg.c_str()), NULL };
+            std::vector<std::string> runtime_env = build_runtime_env(const_cast<char *const *>(effective_envp), new_argv);
+            std::vector<char *> runtime_envp = env_ptrs_from_strings(runtime_env);
             DEBUG_REDIRECT(execvpe, file);
-            const int rc = real_execvpe(file, new_argv, envp);
+            const int rc = real_execvpe(file, new_argv, runtime_envp.data());
             return rc;
         }
     }
@@ -432,15 +682,18 @@ int execvpe(const char *file, char *const argv[], char *const envp[])
 
 int posix_spawn(pid_t *pid, const char *path, const posix_spawn_file_actions_t *file_actions, const posix_spawnattr_t *attrp, char *const argv[], char *const envp[])
 {
-    if (should_redirect_exec(argv))
+    char *const *effective_envp = envp != NULL ? envp : environ;
+    if (should_redirect_exec(argv, const_cast<char *const *>(effective_envp)))
     {
         char tmp_path[PATH_MAX];
-        if (write_hugeargs_file(argv, tmp_path, sizeof(tmp_path)))
+        if (write_hugeargs_file(argv, const_cast<char *const *>(effective_envp), tmp_path, sizeof(tmp_path)))
         {
             std::string file_arg = ARG_FILE_PREFIX+tmp_path;
             char *new_argv[] = { argv[0], const_cast<char *>(file_arg.c_str()), NULL };
+            std::vector<std::string> runtime_env = build_runtime_env(const_cast<char *const *>(effective_envp), new_argv);
+            std::vector<char *> runtime_envp = env_ptrs_from_strings(runtime_env);
             DEBUG_REDIRECT(posix_spawn, path);
-            const int rc = real_posix_spawn(pid, path, file_actions, attrp, new_argv, envp);
+            const int rc = real_posix_spawn(pid, path, file_actions, attrp, new_argv, runtime_envp.data());
             return rc;
         }
     }
@@ -454,15 +707,18 @@ int posix_spawn(pid_t *pid, const char *path, const posix_spawn_file_actions_t *
 
 int posix_spawnp(pid_t *pid, const char *file, const posix_spawn_file_actions_t *file_actions, const posix_spawnattr_t *attrp, char *const argv[], char *const envp[])
 {
-    if (should_redirect_exec(argv))
+    char *const *effective_envp = envp != NULL ? envp : environ;
+    if (should_redirect_exec(argv, const_cast<char *const *>(effective_envp)))
     {
         char tmp_path[PATH_MAX];
-        if (write_hugeargs_file(argv, tmp_path, sizeof(tmp_path)))
+        if (write_hugeargs_file(argv, const_cast<char *const *>(effective_envp), tmp_path, sizeof(tmp_path)))
         {
             std::string file_arg = ARG_FILE_PREFIX+tmp_path;
             char *new_argv[] = { argv[0], const_cast<char *>(file_arg.c_str()), NULL };
+            std::vector<std::string> runtime_env = build_runtime_env(const_cast<char *const *>(effective_envp), new_argv);
+            std::vector<char *> runtime_envp = env_ptrs_from_strings(runtime_env);
             DEBUG_REDIRECT(posix_spawnp, file);
-            const int rc = real_posix_spawnp(pid, file, file_actions, attrp, new_argv, envp);
+            const int rc = real_posix_spawnp(pid, file, file_actions, attrp, new_argv, runtime_envp.data());
             return rc;
         }
     }
@@ -479,29 +735,61 @@ int __libc_start_main(int (*main) (int, char * *, char * *), int argc, char * * 
     if (argc == 2)
     {
         DEBUG_PRN(std::cerr << "Checking for argument file: " << ubp_av[1] << std::endl;)
-        const std::vector<std::string> loaded_args = load_argument_file(ubp_av[1]);
-        if (!loaded_args.empty())
+        const packed_exec_data loaded_data = load_argument_file(ubp_av[1]);
+        if (loaded_data.has_prefix)
         {
             std::deque<std::string> owned_strings;
             std::vector<char *> argv_storage;
-            argv_storage.reserve(loaded_args.size() + 2 + 16);
+            std::vector<std::string> merged_env;
+            std::unordered_map<std::string, std::size_t> env_index;
+
+            for (char **env = ubp_av + argc + 1; env != nullptr && *env != nullptr; ++env)
+            {
+                merged_env.emplace_back(*env);
+            }
+
+            for (std::size_t i = 0; i < merged_env.size(); ++i)
+            {
+                const std::string &entry = merged_env[i];
+                const std::size_t eq = entry.find('=');
+                const std::string key = eq == std::string::npos ? entry : entry.substr(0, eq);
+                env_index[key] = i;
+            }
+
+            for (const auto &entry : loaded_data.env)
+            {
+                const std::size_t eq = entry.find('=');
+                const std::string key = eq == std::string::npos ? entry : entry.substr(0, eq);
+                auto it = env_index.find(key);
+                if (it == env_index.end())
+                {
+                    env_index[key] = merged_env.size();
+                    merged_env.push_back(entry);
+                }
+                else
+                {
+                    merged_env[it->second] = entry;
+                }
+            }
+
+            argv_storage.reserve(loaded_data.args.size() + merged_env.size() + 4);
 
             argv_storage.push_back(ubp_av[0]);
-            for (const auto &arg : loaded_args)
+            for (const auto &arg : loaded_data.args)
             {
                 owned_strings.emplace_back(arg);
                 argv_storage.push_back(const_cast<char *>(owned_strings.back().c_str()));
             }
 
             argv_storage.push_back(nullptr);
-            for (char **env = ubp_av + argc + 1; env != nullptr && *env != nullptr; ++env)
+            for (const auto &env : merged_env)
             {
-                owned_strings.emplace_back(*env);
+                owned_strings.emplace_back(env);
                 argv_storage.push_back(const_cast<char *>(owned_strings.back().c_str()));
             }
             argv_storage.push_back(nullptr);
 
-            const int new_argc = static_cast<int>(1 + loaded_args.size());
+            const int new_argc = static_cast<int>(1 + loaded_data.args.size());
 
             DEBUG_PRN({
                 std::cerr << "Loaded arguments from file: " << ubp_av[1] << std::endl;

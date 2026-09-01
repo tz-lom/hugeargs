@@ -9,4 +9,4 @@ argname=$(mktemp -p "$HUGEARGS_TMPDIR" "hugeargs-XXXXXX")
 
 printf '%s\0' ${@:2} > "$argname"
 
-"$executable" "$argname"
+"$executable" "--HUGEARGS_PLEASE_LOAD_ARGUMENTS_FROM_FILE=$argname"

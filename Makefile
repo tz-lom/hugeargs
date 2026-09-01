@@ -1,7 +1,7 @@
-.PHONY: all clean
+.PHONY: all clean test
 
 CXX = g++
-CXXFLAGS = -std=c++17 -Wall -O0 -g -DDEBUG
+CXXFLAGS = -std=c++17 -Wall -O0 # -g -DDEBUG
 
 all: libhugeargs.so
 

@@ -1,4 +1,4 @@
 *.so
-myecho
-myenv
-libarghack.so
+test/build
+ha
+
