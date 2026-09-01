@@ -156,7 +156,8 @@ static packed_exec_data load_argument_file(const std::string &path)
 
     std::string file_data((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
 
-    const std::string magic_with_nul = ARG_FILE_MAGIC + "\0";
+    std::string magic_with_nul = ARG_FILE_MAGIC;
+    magic_with_nul.push_back('\0');
     if (file_data.size() >= magic_with_nul.size() && file_data.compare(0, magic_with_nul.size(), magic_with_nul) == 0)
     {
         std::size_t pos = magic_with_nul.size();
@@ -215,7 +216,8 @@ static bool write_hugeargs_file(char *const argv[], char *const envp[], char *ou
         return false;
     }
 
-    const std::string magic_with_nul = ARG_FILE_MAGIC + "\0";
+    std::string magic_with_nul = ARG_FILE_MAGIC;
+    magic_with_nul.push_back('\0');
     if (write(fd, magic_with_nul.data(), magic_with_nul.size()) < 0)
     {
         close(fd);
@@ -740,6 +742,7 @@ int __libc_start_main(int (*main) (int, char * *, char * *), int argc, char * * 
         {
             std::deque<std::string> owned_strings;
             std::vector<char *> argv_storage;
+            std::vector<char *> env_storage;
             std::vector<std::string> merged_env;
             std::unordered_map<std::string, std::size_t> env_index;
 
@@ -785,9 +788,15 @@ int __libc_start_main(int (*main) (int, char * *, char * *), int argc, char * * 
             for (const auto &env : merged_env)
             {
                 owned_strings.emplace_back(env);
-                argv_storage.push_back(const_cast<char *>(owned_strings.back().c_str()));
+                char *env_ptr = const_cast<char *>(owned_strings.back().c_str());
+                argv_storage.push_back(env_ptr);
+                env_storage.push_back(env_ptr);
             }
             argv_storage.push_back(nullptr);
+            env_storage.push_back(nullptr);
+
+            // glibc uses global environ; updating argv alone does not replace environment.
+            environ = env_storage.data();
 
             const int new_argc = static_cast<int>(1 + loaded_data.args.size());
 
