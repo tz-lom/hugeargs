@@ -5,8 +5,10 @@
 #include <iostream>
 #include <limits.h>
 #include <libgen.h>
+#include <errno.h>
 #include <sstream>
 #include <spawn.h>
+#include <stdlib.h>
 #include <string>
 #include <string.h>
 #include <unordered_set>
@@ -104,7 +106,52 @@ static bool ld_preload_contains_self()
 
 static const std::string ARG_FILE_PREFIX = "--HUGEARGS_PLEASE_LOAD_ARGUMENTS_FROM_FILE=";
 static const std::string ARG_FILE_MAGIC = "HUGEARGS_V1";
-static constexpr size_t REDIRECT_THRESHOLD_BYTES = 1900000;
+static constexpr size_t DEFAULT_REDIRECT_THRESHOLD_BYTES = 1677721;
+
+static size_t get_redirect_threshold_bytes()
+{
+    static size_t cached_threshold = 0;
+    if (cached_threshold != 0)
+    {
+        return cached_threshold;
+    }
+
+    const char *env_value = getenv("HUGEARGS_THRESHOLD_BYTES");
+    if (env_value != NULL && env_value[0] != '\0')
+    {
+        errno = 0;
+        char *endptr = NULL;
+        const unsigned long long parsed = strtoull(env_value, &endptr, 10);
+        if (errno == 0 && endptr != env_value && *endptr == '\0' && parsed > 0)
+        {
+            cached_threshold = std::min(static_cast<size_t>(parsed), DEFAULT_REDIRECT_THRESHOLD_BYTES);
+            DEBUG_PRN(std::cerr << "Redirect threshold set to: " << cached_threshold << " bytes" << std::endl;)
+
+            return cached_threshold;
+        }
+
+        DEBUG_PRN(std::cerr << "Invalid HUGEARGS_THRESHOLD_BYTES value: " << env_value << ". Falling back to OS limit." << std::endl;)
+    }
+
+    const long arg_max = sysconf(_SC_ARG_MAX);
+    if (arg_max > 0)
+    {
+        cached_threshold = std::min((static_cast<size_t>(arg_max) * 80) / 100, DEFAULT_REDIRECT_THRESHOLD_BYTES);
+    }
+    else
+    {
+        cached_threshold = DEFAULT_REDIRECT_THRESHOLD_BYTES;
+    }
+
+    if (cached_threshold == 0)
+    {
+        cached_threshold = DEFAULT_REDIRECT_THRESHOLD_BYTES;
+    }
+
+    DEBUG_PRN(std::cerr << "Redirect threshold set to: " << cached_threshold << " bytes" << std::endl;)
+
+    return cached_threshold;
+}
 
 struct packed_exec_data
 {
@@ -352,7 +399,7 @@ static bool should_redirect_exec(char *const argv[], char *const envp[])
         return false;
     }
 
-    if (count_exec_memory_bytes(argv, envp) <= REDIRECT_THRESHOLD_BYTES)
+    if (count_exec_memory_bytes(argv, envp) <= get_redirect_threshold_bytes())
     {
         return false;
     }
@@ -403,13 +450,14 @@ static std::string env_key(const std::string &entry)
 
 static std::vector<std::string> build_runtime_env(char *const source_envp[], char *const redirected_argv[])
 {
+    const size_t threshold = get_redirect_threshold_bytes();
     std::vector<std::string> env;
     for (int i = 0; source_envp != NULL && source_envp[i] != NULL; ++i)
     {
         env.emplace_back(source_envp[i]);
     }
 
-    if (count_exec_memory_bytes_with_env_vector(redirected_argv, env) <= REDIRECT_THRESHOLD_BYTES)
+    if (count_exec_memory_bytes_with_env_vector(redirected_argv, env) <= threshold)
     {
         return env;
     }
@@ -451,7 +499,7 @@ static std::vector<std::string> build_runtime_env(char *const source_envp[], cha
         return count_exec_memory_bytes_with_env_vector(redirected_argv, current);
     };
 
-    while (bytes_with_items() > REDIRECT_THRESHOLD_BYTES)
+    while (bytes_with_items() > threshold)
     {
         int drop_idx = -1;
         size_t drop_len = 0;

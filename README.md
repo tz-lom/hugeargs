@@ -77,7 +77,9 @@ LD_PRELOAD=./libhugeargs.so <command> [args...]
 - `HUGEARGS_IGNORE`
   - Colon-separated executable basenames to exclude from redirection.
   - Example: `HUGEARGS_IGNORE=python:node`
-
+- `HUGEARGS_THRESHOLD_BYTES`
+  - Set threshold of how many bytes are used to trigger argument packing
+  - Threshold is set as a minimum of `HUGEARGS_THRESHOLD_BYTES` env variable, 80% of `sysconf(_SC_ARG_MAX)` and 1677721 (80% of 2Mb - modern linux threshold)
 ## Testing
 
 Run project tests:
